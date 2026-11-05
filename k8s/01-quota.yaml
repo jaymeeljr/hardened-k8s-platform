@@ -1,0 +1,35 @@
+# Caps on what the namespace can consume, so one compromised or buggy
+# workload cannot starve the cluster (resource-exhaustion / crypto-mining).
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: platform-quota
+  namespace: platform
+spec:
+  hard:
+    pods: "20"
+    requests.cpu: "2"
+    requests.memory: 2Gi
+    limits.cpu: "4"
+    limits.memory: 4Gi
+    services.loadbalancers: "0"
+    services.nodeports: "0"
+---
+# Defaults for any container that forgets to declare its own limits.
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: platform-defaults
+  namespace: platform
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 200m
+        memory: 128Mi
+      defaultRequest:
+        cpu: 50m
+        memory: 64Mi
+      max:
+        cpu: "1"
+        memory: 512Mi

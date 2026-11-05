@@ -1,0 +1,86 @@
+# Data tier. Its config (including the password) is a Secret generated at
+# deploy time, never committed, and mounted as a file rather than exposed as
+# an environment variable. Persistence is off, so the root FS stays read-only.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: platform
+  labels:
+    app.kubernetes.io/name: redis
+    app.kubernetes.io/component: data
+  annotations:
+    checkov.io/skip1: CKV_K8S_43=Tag-pinned; digest pinning planned via Renovate (see README)
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: redis
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: redis
+        app.kubernetes.io/component: data
+    spec:
+      serviceAccountName: redis
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10003
+        runAsGroup: 10003
+        fsGroup: 10003
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: redis:7.4-alpine
+          imagePullPolicy: Always
+          args: ["/etc/redis/redis.conf"]
+          ports:
+            - containerPort: 6379
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          readinessProbe:
+            tcpSocket:
+              port: 6379
+          livenessProbe:
+            tcpSocket:
+              port: 6379
+            initialDelaySeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /etc/redis
+              readOnly: true
+      volumes:
+        - name: data
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: config
+          secret:
+            secretName: redis-config
+            defaultMode: 0440   # readable by fsGroup only
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: platform
+spec:
+  selector:
+    app.kubernetes.io/name: redis
+  ports:
+    - port: 6379
+      targetPort: 6379

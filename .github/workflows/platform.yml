@@ -1,0 +1,146 @@
+name: Hardened K8s Platform
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CALICO_VERSION: v3.32.3
+  FALCO_CHART_VERSION: 9.2.2
+
+jobs:
+  # ------------------------------------------------------------------
+  # Static checks: nothing is deployed until the code itself is clean
+  # ------------------------------------------------------------------
+  terraform:
+    name: Terraform fmt + validate
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform/aws-eks
+    steps:
+      - uses: actions/checkout@v5
+      - uses: hashicorp/setup-terraform@v3.1.2
+        with:
+          terraform_version: 1.17.1
+      - run: terraform fmt -check -recursive -diff
+      - run: terraform init -backend=false -input=false
+      - run: terraform validate
+
+  iac-scan:
+    name: Checkov + OPA policies + ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Checkov (Kubernetes + Terraform)
+        run: |
+          pip install checkov==3.2.469
+          checkov -d k8s --framework kubernetes --compact --quiet
+          checkov -d terraform --framework terraform --download-external-modules false --compact --quiet
+      - name: Install Conftest
+        run: |
+          curl -sSL https://github.com/open-policy-agent/conftest/releases/download/v0.62.0/conftest_0.62.0_Linux_x86_64.tar.gz | tar xz conftest
+          sudo mv conftest /usr/local/bin/
+      - run: conftest verify --policy policy/
+      - run: conftest test k8s/ --policy policy/
+      - name: ShellCheck
+        run: shellcheck -x scripts/*.sh tests/*.sh
+
+  # ------------------------------------------------------------------
+  # End-to-end: real cluster, real attacks, real assertions
+  # ------------------------------------------------------------------
+  e2e:
+    name: Cluster security tests (kind + Calico + Falco)
+    runs-on: ubuntu-latest
+    needs: [terraform, iac-scan]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check out the API from secure-cicd-pipeline
+        uses: actions/checkout@v5
+        with:
+          repository: jaymeeljr/secure-cicd-pipeline
+          path: api-src
+
+      - name: Build API image
+        run: docker build -t task-api:e2e api-src
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1.15.2
+        with:
+          version: v0.30.0
+          config: kind/cluster.yaml
+          cluster_name: hardened
+          wait: 0s   # nodes stay NotReady until Calico is installed
+
+      - name: Install Calico (NetworkPolicy enforcement)
+        run: |
+          kubectl apply -f "https://raw.githubusercontent.com/projectcalico/calico/${CALICO_VERSION}/manifests/calico.yaml"
+          kubectl -n kube-system rollout status daemonset/calico-node --timeout=300s
+          kubectl wait --for=condition=Ready nodes --all --timeout=300s
+
+      - name: Load API image and deploy platform
+        run: |
+          kind load docker-image task-api:e2e --name hardened
+          ./scripts/deploy.sh
+
+      - name: Test Pod Security admission
+        run: bash tests/test-pod-security.sh
+
+      - name: Test RBAC
+        run: bash tests/test-rbac.sh
+
+      - name: Test NetworkPolicy segmentation
+        run: bash tests/test-network-policy.sh
+
+      - uses: azure/setup-helm@v4.3.1
+
+      - name: Install Falco
+        run: |
+          helm repo add falcosecurity https://falcosecurity.github.io/charts
+          helm upgrade --install falco falcosecurity/falco --version "$FALCO_CHART_VERSION" \
+            --namespace falco --create-namespace -f falco/values.yaml --wait --timeout 6m
+
+      - name: Test Falco runtime detection
+        run: bash tests/test-falco.sh
+
+      - name: CIS benchmark (kube-bench)
+        if: always()
+        run: |
+          kubectl apply -f kube-bench/job.yaml
+          kubectl -n kube-bench wait --for=condition=complete job/kube-bench --timeout=180s || true
+          kubectl -n kube-bench logs job/kube-bench > kube-bench-report.txt || true
+          {
+            echo "## CIS Kubernetes Benchmark (kube-bench)"
+            echo "kind is a development cluster, so some control-plane checks are expected to fail;"
+            echo "the report documents the baseline. Managed EKS handles control-plane hardening."
+            echo '```'
+            grep -A6 "== Summary total ==" kube-bench-report.txt || echo "no summary produced"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: kube-bench-report
+          path: kube-bench-report.txt
+          if-no-files-found: ignore
+
+      - name: Debug info on failure
+        if: failure()
+        run: |
+          kubectl get pods -A -o wide
+          kubectl -n platform describe pods | tail -n 80
+          kubectl get events -A --sort-by=.lastTimestamp | tail -n 40
+          kubectl -n falco logs -l app.kubernetes.io/name=falco -c falco --tail=50 || true

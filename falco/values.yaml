@@ -1,0 +1,56 @@
+# Helm values for the Falco runtime-security agent (chart falcosecurity/falco).
+# Falco runs in its own namespace: it needs kernel access to watch syscalls,
+# so it is the one deliberate exception to the restricted policy.
+driver:
+  kind: modern_ebpf
+
+tty: true
+
+falco:
+  json_output: true
+  priority: notice
+
+customRules:
+  platform-rules.yaml: |-
+    - list: platform_package_managers
+      items: [apt, apt-get, dpkg, apk, pip, pip3, yum, dnf]
+
+    - rule: Shell spawned in hardened namespace
+      desc: >
+        An interactive or scripted shell started inside a workload in the
+        platform namespace. None of these apps ever needs a shell, so this
+        usually means kubectl exec or a remote-code-execution exploit.
+      condition: >
+        spawned_process and container and k8s.ns.name = "platform"
+        and proc.name in (shell_binaries)
+      output: >
+        Shell in platform workload (user=%user.name pod=%k8s.pod.name
+        container=%container.name shell=%proc.name cmdline=%proc.cmdline)
+      priority: WARNING
+      tags: [platform, mitre_execution, T1059]
+
+    - rule: Package manager run in hardened namespace
+      desc: >
+        Installing software inside a running container breaks immutability
+        and is a common step after initial compromise.
+      condition: >
+        spawned_process and container and k8s.ns.name = "platform"
+        and proc.name in (platform_package_managers)
+      output: >
+        Package manager in platform workload (pod=%k8s.pod.name
+        cmdline=%proc.cmdline)
+      priority: ERROR
+      tags: [platform, mitre_persistence, T1072]
+
+    - rule: Outbound connection from data tier
+      desc: >
+        The Redis tier only answers requests; it never opens connections.
+        Any outbound connect is likely data exfiltration.
+      condition: >
+        outbound and container and k8s.ns.name = "platform"
+        and k8s.pod.name startswith "redis"
+      output: >
+        Outbound connection from data tier (pod=%k8s.pod.name
+        connection=%fd.name)
+      priority: CRITICAL
+      tags: [platform, mitre_exfiltration, T1041]
